@@ -1,23 +1,52 @@
 #!/usr/bin/env python3
-"""Une o guia XMLTV Fr completo e o da Pluto TV França, sem dependências."""
+"""EPG da TV francesa e Pluto TV compatível com o tvg-id de iptv-org.
+
+Preserva os IDs originais de cada guia e cria cópias somente para os
+identificadores da playlist que diferem do XMLTV (ex.: France2.fr@SD).
+"""
 import argparse
+import copy
 import gzip
 import html
+import re
 import sys
 import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 TV = 'https://xmltvfr.fr/xmltv/xmltv.xml.gz'
 PLUTO = 'https://i.mjh.nz/PlutoTV/fr.xml.gz'
+PLAYLIST = 'https://iptv-org.github.io/iptv/languages/fra.m3u'
+
+# Equivalências verificadas com o catálogo público do XMLTV Fr.
+# Não aproximamos versões com programação potencialmente distinta.
+EQUIVALENCIAS = {
+    'TV5MondeAfrica.fr': 'TV5MondeAfrique.fr',
+    'TV5MondeAsia.fr': 'TV5MondeAsie.fr',
+    'TV5MondePacific.fr': 'TV5MondePacifique.fr',
+    'TV5MondeLatinAmerica.fr': 'TV5MondeAmeriqueLatine.fr',
+    'TV5MondeStyle.fr': 'TV5Style.fr',
+}
+# Apenas diferenças de qualidade de imagem são equivalentes.
+# @Arabic, @English, @French e variantes regionais NÃO são mescladas.
+QUALIDADES = {'SD', 'HD', 'FHD', 'UHD', '4K', '8K', '720P', '1080P', '2160P'}
+ID_M3U = re.compile(r'\btvg-id\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def abrir_url(url, timeout=90):
+    pedido = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 EPG-Frances-Compativel/2.0',
+        'Accept': '*/*',
+    })
+    return urllib.request.urlopen(pedido, timeout=timeout)
 
 
 def baixar(url, destino):
-    pedido = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 XMLTV-EPG-Merge/1.0'})
     total = 0
-    with urllib.request.urlopen(pedido, timeout=90) as resposta, destino.open('wb') as arquivo:
+    with abrir_url(url) as resposta, destino.open('wb') as arquivo:
         while bloco := resposta.read(1024 * 1024):
             total += len(bloco)
             if total > 80 * 1024 * 1024:
@@ -29,8 +58,34 @@ def baixar(url, destino):
     print(f'Baixado: {url} ({total / 1048576:.1f} MB)', flush=True)
 
 
+def ler_ids_m3u(texto):
+    """Lê apenas metadados EXTINF; não baixa nenhum endereço de streaming."""
+    if not texto.lstrip('\ufeff\r\n ').startswith('#EXTM3U'):
+        raise ValueError('Playlist IPTV-org não começa por #EXTM3U.')
+    ids = set()
+    for linha in texto.splitlines():
+        if linha.startswith('#EXTINF:'):
+            encontrado = ID_M3U.search(linha)
+            if encontrado:
+                ids.add(encontrado.group(1).strip())
+    if len(ids) < 10:
+        raise ValueError('Playlist IPTV-org devolveu poucos tvg-id; atualização cancelada.')
+    return ids
+
+
+def obter_ids_playlist(url):
+    limite = 15 * 1024 * 1024
+    with abrir_url(url, timeout=60) as resposta:
+        dados = resposta.read(limite + 1)
+    if len(dados) > limite:
+        raise ValueError('Playlist excede 15 MB.')
+    ids = ler_ids_m3u(dados.decode('utf-8-sig', errors='replace'))
+    print(f'Playlist: {len(ids)} identificadores distintos ({url})', flush=True)
+    return ids
+
+
 def elementos(arquivo_gz, tipo):
-    """Lê filhos de <tv> em fluxo; descarta itens processados da memória."""
+    """Lê os filhos de <tv> por streaming para limitar o consumo de memória."""
     with gzip.open(arquivo_gz, 'rb') as arquivo:
         raiz, nivel = None, 0
         for evento, item in ET.iterparse(arquivo, events=('start', 'end')):
@@ -48,62 +103,110 @@ def elementos(arquivo_gz, tipo):
                 nivel -= 1
 
 
-def mesclar(fontes, pasta_saida):
+def identificar_equivalente(id_m3u, ids_existentes):
+    """Retorna ID original correspondente ou None, sem associar línguas distintas."""
+    if id_m3u in ids_existentes:
+        return None  # Já existe correspondência exata; não sobrepor.
+    principal, separador, variante = id_m3u.partition('@')
+    if separador and variante.upper() not in QUALIDADES:
+        return None
+    original = EQUIVALENCIAS.get(principal, principal)
+    if original != id_m3u and original in ids_existentes:
+        return original
+    return None
+
+
+def copiar_com_atributo(item, atributo, valor):
+    copia = copy.deepcopy(item)
+    copia.set(atributo, valor)
+    return copia
+
+
+def mesclar(fontes, pasta_saida, ids_playlist=None):
+    """Combina os XMLTVs e adiciona os IDs usados pela playlist, quando seguros."""
     pasta_saida.mkdir(parents=True, exist_ok=True)
     destino = pasta_saida / 'epg.xml.gz'
     temporario = pasta_saida / 'epg.xml.gz.tmp'
     permitidos = [set() for _ in fontes]
-    conhecidos = set()
-    qt_canais, qt_programas = 0, [0] * len(fontes)
+    origens = {}
+    canais = []
+    qt_programas_originais = [0] * len(fontes)
+    qt_programas_alias = 0
+    ids_playlist = ids_playlist or set()
     try:
         with temporario.open('wb') as bruto, gzip.GzipFile(fileobj=bruto, mode='wb', compresslevel=6, mtime=0) as saida:
             saida.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-            saida.write(b'<tv generator-info-name="XMLTV Fr + Pluto TV France">\n')
-            # Primeiro canais; depois programas. IDs duplicados: prevalece a primeira fonte.
+            saida.write(b'<tv generator-info-name="XMLTV Fr + Pluto TV / IPTV-org">\n')
+            # 1: canais originais; a primeira fonte prevalece em IDs duplicados.
             for i, fonte in enumerate(fontes):
                 for item in elementos(fonte, 'channel'):
                     id_canal = item.get('id')
-                    if not id_canal or id_canal in conhecidos:
+                    if not id_canal or id_canal in origens:
                         continue
-                    conhecidos.add(id_canal)
+                    origens[id_canal] = i
                     permitidos[i].add(id_canal)
-                    saida.write(ET.tostring(item, encoding='utf-8') + b'\n')
-                    qt_canais += 1
+                    canais.append((id_canal, ET.tostring(item, encoding='utf-8')))
             if any(not ids for ids in permitidos):
                 raise ValueError('Uma das fontes não retornou canais exclusivos válidos.')
+
+            # 2: localizar diferenças de IDs M3U, sem substituir os originais.
+            alias_por_original = defaultdict(list)
+            for id_m3u in sorted(ids_playlist):
+                original = identificar_equivalente(id_m3u, origens)
+                if original:
+                    alias_por_original[original].append(id_m3u)
+            for id_canal, xml_bytes in canais:
+                saida.write(xml_bytes + b'\n')
+                for alias in alias_por_original.get(id_canal, ()):
+                    item = ET.fromstring(xml_bytes)
+                    saida.write(ET.tostring(copiar_com_atributo(item, 'id', alias), encoding='utf-8') + b'\n')
+
+            # 3: programas originais + uma cópia para cada alias correspondente.
             for i, fonte in enumerate(fontes):
                 for item in elementos(fonte, 'programme'):
-                    if item.get('channel') not in permitidos[i]:
+                    original = item.get('channel')
+                    if original not in permitidos[i]:
                         continue
                     saida.write(ET.tostring(item, encoding='utf-8') + b'\n')
-                    qt_programas[i] += 1
-            if any(n == 0 for n in qt_programas):
+                    qt_programas_originais[i] += 1
+                    for alias in alias_por_original.get(original, ()):
+                        copia = copiar_com_atributo(item, 'channel', alias)
+                        saida.write(ET.tostring(copia, encoding='utf-8') + b'\n')
+                        qt_programas_alias += 1
+            if any(n == 0 for n in qt_programas_originais):
                 raise ValueError('Uma das fontes não retornou programação válida.')
             saida.write(b'</tv>\n')
         temporario.replace(destino)
-        q = sum(qt_programas)
+        total = sum(qt_programas_originais) + qt_programas_alias
         momento = datetime.now(timezone.utc).strftime('%d/%m/%Y às %H:%M UTC')
         pagina = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>EPG francês</title>
 <style>body{{font:16px system-ui;max-width:700px;margin:3em auto;padding:1em;line-height:1.6}}</style>
 </head><body><h1>EPG francês unificado</h1>
 <p>Atualizado em: {html.escape(momento)}.</p>
-<p>{qt_canais} canais e {q} programas.</p>
+<p>{len(canais)} canais originais, {sum(map(len, alias_por_original.values()))} identificadores adicionais e {total} programas.</p>
 <p><a href="epg.xml.gz">EPG XMLTV combinado (.xml.gz)</a></p>
-<p>Copie o endereço do link acima para o iPlayTV. A lista M3U não é modificada.</p>
-<p>A associação depende da compatibilidade dos identificadores <code>tvg-id</code> e <code>channel id</code>.</p>
+<p>Compatibilidade automática com os IDs de <code>{html.escape(PLAYLIST)}</code>.</p>
+<p>As variantes linguísticas e regionais não são confundidas com outros canais.</p>
 </body></html>'''
         (pasta_saida / 'index.html').write_text(pagina, encoding='utf-8')
-        print(f'Concluído: {qt_canais} canais; {q} programas; {destino.stat().st_size / 1048576:.1f} MB.', flush=True)
-        return qt_canais, q
+        print(f'Concluído: {len(canais)} canais originais; '
+              f'{sum(map(len, alias_por_original.values()))} aliases; '
+              f'{total} programas; arquivo {destino.stat().st_size / 1048576:.1f} MB.', flush=True)
+        # Mostra exemplos para depuração no registro do GitHub Actions.
+        for original, aliases in sorted(alias_por_original.items()):
+            if original.startswith(('France2.', 'TF1.', 'TV5Monde')):
+                print(f'  {original} -> {", ".join(aliases)}', flush=True)
+        return len(canais) + sum(map(len, alias_por_original.values())), total
     finally:
         temporario.unlink(missing_ok=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Combina dois EPGs franceses para iPlayTV')
+    parser = argparse.ArgumentParser(description='Combina XMLTV Fr e Pluto TV com IDs de iptv-org')
     parser.add_argument('--url-tv', default=TV)
     parser.add_argument('--url-pluto', default=PLUTO)
+    parser.add_argument('--url-playlist', default=PLAYLIST)
     parser.add_argument('--output-dir', type=Path, default=Path('site'))
     args = parser.parse_args()
     try:
@@ -111,9 +214,10 @@ def main():
             fontes = [Path(pasta) / 'tv.xml.gz', Path(pasta) / 'pluto.xml.gz']
             baixar(args.url_tv, fontes[0])
             baixar(args.url_pluto, fontes[1])
-            mesclar(fontes, args.output_dir)
+            ids_playlist = obter_ids_playlist(args.url_playlist)
+            mesclar(fontes, args.output_dir, ids_playlist)
         return 0
-    except (OSError, ValueError, EOFError, ET.ParseError) as erro:
+    except (OSError, ValueError, EOFError, ET.ParseError, UnicodeError) as erro:
         print('ERRO: ' + str(erro), file=sys.stderr)
         return 1
 
