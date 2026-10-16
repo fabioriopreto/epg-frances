@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""EPG da TV francesa e Pluto TV compatível com o tvg-id de iptv-org.
+"""EPG unificado + playlist IPTV-org com IDs corrigidos automaticamente.
 
-Preserva os IDs originais de cada guia e cria cópias somente para os
-identificadores da playlist que diferem do XMLTV (ex.: France2.fr@SD).
+Preserva as fontes XMLTV/Pluto e gera um M3U derivado com canais e URLs
+originais, mas com tvg-id equivalente ao ID primário do EPG.
 """
 import argparse
 import copy
@@ -30,10 +30,24 @@ EQUIVALENCIAS = {
     'TV5MondeLatinAmerica.fr': 'TV5MondeAmeriqueLatine.fr',
     'TV5MondeStyle.fr': 'TV5Style.fr',
 }
+# Os identificadores regionais de France 3 usam um padrão diferente em IPTV-org.
+REGIOES_FRANCE3 = {
+    'National': 'France3.fr',
+    'ParisIledeFrance': 'France3ParisIdF.fr',
+    'Corse': 'France3CorseViaStella.fr',
+    'CotedAzur': 'France3CotedAzur.fr',
+    'PaysdelaLoire': 'France3PaysDeLaLoire.fr',
+    'NordPasdeCalais': 'France3NordPasDeCalais.fr',
+    'NouvelleAquitaine': 'France3NouvelleAquitaine.fr',
+    'LanguedocRoussillon': 'France3Languedoc.fr',
+    'BasseNormandie': 'France3BasseNormandie.fr',
+    'HauteNormandie': 'France3HauteNormandie.fr',
+}
+
 # Apenas diferenças de qualidade de imagem são equivalentes.
 # @Arabic, @English, @French e variantes regionais NÃO são mescladas.
 QUALIDADES = {'SD', 'HD', 'FHD', 'UHD', '4K', '8K', '720P', '1080P', '2160P'}
-ID_M3U = re.compile(r'\btvg-id\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+ID_M3U = re.compile(r'(\btvg-id\s*=\s*)(["\'])([^"\']+)(["\'])', re.IGNORECASE)
 
 
 def abrir_url(url, timeout=90):
@@ -67,21 +81,22 @@ def ler_ids_m3u(texto):
         if linha.startswith('#EXTINF:'):
             encontrado = ID_M3U.search(linha)
             if encontrado:
-                ids.add(encontrado.group(1).strip())
+                ids.add(encontrado.group(3).strip())
     if len(ids) < 10:
         raise ValueError('Playlist IPTV-org devolveu poucos tvg-id; atualização cancelada.')
     return ids
 
 
-def obter_ids_playlist(url):
+def obter_playlist(url):
     limite = 15 * 1024 * 1024
     with abrir_url(url, timeout=60) as resposta:
         dados = resposta.read(limite + 1)
     if len(dados) > limite:
         raise ValueError('Playlist excede 15 MB.')
-    ids = ler_ids_m3u(dados.decode('utf-8-sig', errors='replace'))
+    texto = dados.decode('utf-8-sig', errors='replace')
+    ids = ler_ids_m3u(texto)
     print(f'Playlist: {len(ids)} identificadores distintos ({url})', flush=True)
-    return ids
+    return texto, ids
 
 
 def elementos(arquivo_gz, tipo):
@@ -104,16 +119,60 @@ def elementos(arquivo_gz, tipo):
 
 
 def identificar_equivalente(id_m3u, ids_existentes):
-    """Retorna ID original correspondente ou None, sem associar línguas distintas."""
+    """Encontra correspondência unívoca e segura com um ID XMLTV existente."""
     if id_m3u in ids_existentes:
-        return None  # Já existe correspondência exata; não sobrepor.
+        return None  # Já casa exatamente; não criar alias.
     principal, separador, variante = id_m3u.partition('@')
-    if separador and variante.upper() not in QUALIDADES:
+    if principal == 'France3.fr' and separador:
+        if variante.upper() in QUALIDADES and 'France3.fr' in ids_existentes:
+            return 'France3.fr'
+        nome = REGIOES_FRANCE3.get(variante, 'France3' + variante + '.fr')
+        if nome in ids_existentes:
+            return nome
         return None
-    original = EQUIVALENCIAS.get(principal, principal)
-    if original != id_m3u and original in ids_existentes:
-        return original
+    if separador and variante.upper() not in QUALIDADES:
+        return None  # Não misturar idiomas, países ou regiões.
+    nome = EQUIVALENCIAS.get(principal, principal)
+    if nome in ids_existentes:
+        return nome
+    # Aceitar diferença de maiúsculas/minúsculas somente se não houver ambiguidade.
+    candidatos = [canal for canal in ids_existentes if canal.casefold() == nome.casefold()]
+    if len(candidatos) == 1:
+        return candidatos[0]
     return None
+
+
+def preparar_playlist(texto_m3u, ids_existentes, destino):
+    """Gera playlist com os mesmos streams, substituindo SOMENTE tvg-id seguro.
+
+    NÃO modifica urls, diretivas de cabeçalho ou opções de reprodução.
+    Nunca cria correspondências por semelhança aproximada de nomes.
+    """
+    if not texto_m3u.lstrip('\ufeff\r\n ').startswith('#EXTM3U'):
+        raise ValueError('Playlist recebida não é M3U válida.')
+    linhas = []
+    ajustados = {}
+    matches = set()
+    presentes = 0
+    for linha in texto_m3u.splitlines(keepends=True):
+        if linha.startswith('#EXTINF:'):
+            resultado = ID_M3U.search(linha)
+            if resultado:
+                id_antigo = resultado.group(3)
+                presentes += 1
+                alvo = id_antigo if id_antigo in ids_existentes else identificar_equivalente(id_antigo, ids_existentes)
+                if alvo:
+                    matches.add(alvo)
+                    if alvo != id_antigo:
+                        ajustados[id_antigo] = alvo
+                        linha = linha[:resultado.start(3)] + alvo + linha[resultado.end(3):]
+        linhas.append(linha)
+    if presentes < 10:
+        raise ValueError('Playlist recebida tem menos de 10 canais com tvg-id.')
+    temporario = destino.with_suffix('.m3u.tmp')
+    temporario.write_text(''.join(linhas), encoding='utf-8')
+    temporario.replace(destino)
+    return ajustados, presentes, len(matches)
 
 
 def copiar_com_atributo(item, atributo, valor):
@@ -122,7 +181,7 @@ def copiar_com_atributo(item, atributo, valor):
     return copia
 
 
-def mesclar(fontes, pasta_saida, ids_playlist=None):
+def mesclar(fontes, pasta_saida, ids_playlist=None, texto_playlist=None):
     """Combina os XMLTVs e adiciona os IDs usados pela playlist, quando seguros."""
     pasta_saida.mkdir(parents=True, exist_ok=True)
     destino = pasta_saida / 'epg.xml.gz'
@@ -155,6 +214,13 @@ def mesclar(fontes, pasta_saida, ids_playlist=None):
                 original = identificar_equivalente(id_m3u, origens)
                 if original:
                     alias_por_original[original].append(id_m3u)
+            # Construir playlist com os IDs CANÔNICOS, não os alias, para o iPlayTV.
+            ajustes = {}
+            quantidade_m3u = 0
+            correspondencias = 0
+            if texto_playlist is not None:
+                ajustes, quantidade_m3u, correspondencias = preparar_playlist(
+                    texto_playlist, set(origens), pasta_saida / 'playlist.m3u')
             for id_canal, xml_bytes in canais:
                 saida.write(xml_bytes + b'\n')
                 for alias in alias_por_original.get(id_canal, ()):
@@ -186,10 +252,16 @@ def mesclar(fontes, pasta_saida, ids_playlist=None):
 <p>Atualizado em: {html.escape(momento)}.</p>
 <p>{len(canais)} canais originais, {sum(map(len, alias_por_original.values()))} identificadores adicionais e {total} programas.</p>
 <p><a href="epg.xml.gz">EPG XMLTV combinado (.xml.gz)</a></p>
-<p>Compatibilidade automática com os IDs de <code>{html.escape(PLAYLIST)}</code>.</p>
+<p><a href="playlist.m3u">Playlist com IDs corrigidos (.m3u)</a></p>
+<p>{len(ajustes)} identificadores diferentes corrigidos na playlist, {quantidade_m3u} entradas M3U com tvg-id analisadas.</p>
+<p>Playlist de origem: <code>{html.escape(PLAYLIST)}</code>. Os endereços de transmissão são preservados.</p>
 <p>As variantes linguísticas e regionais não são confundidas com outros canais.</p>
 </body></html>'''
         (pasta_saida / 'index.html').write_text(pagina, encoding='utf-8')
+        print(f'Playlist corrigida: {len(ajustes)} tvg-id distintos alterados; {quantidade_m3u} entradas analisadas; {correspondencias} canais XMLTV únicos correspondentes.', flush=True)
+        for id_antigo, id_novo in sorted(ajustes.items()):
+            if id_antigo.startswith(('TV5MondeEurope.', 'TV5MondeAfrica.', 'France3.fr@Lorraine', 'France3.fr@CotedAzur')):
+                print(f'  M3U corrigido: {id_antigo} -> {id_novo}', flush=True)
         print(f'Concluído: {len(canais)} canais originais; '
               f'{sum(map(len, alias_por_original.values()))} aliases; '
               f'{total} programas; arquivo {destino.stat().st_size / 1048576:.1f} MB.', flush=True)
@@ -214,8 +286,8 @@ def main():
             fontes = [Path(pasta) / 'tv.xml.gz', Path(pasta) / 'pluto.xml.gz']
             baixar(args.url_tv, fontes[0])
             baixar(args.url_pluto, fontes[1])
-            ids_playlist = obter_ids_playlist(args.url_playlist)
-            mesclar(fontes, args.output_dir, ids_playlist)
+            texto_playlist, ids_playlist = obter_playlist(args.url_playlist)
+            mesclar(fontes, args.output_dir, ids_playlist, texto_playlist)
         return 0
     except (OSError, ValueError, EOFError, ET.ParseError, UnicodeError) as erro:
         print('ERRO: ' + str(erro), file=sys.stderr)
